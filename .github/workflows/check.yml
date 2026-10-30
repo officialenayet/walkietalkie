@@ -1,0 +1,18 @@
+name: Check APK
+on: workflow_dispatch
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download latest APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download --repo ${{ github.repository }} --pattern app-debug.apk
+      - name: Inspect
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          ls -l app-debug.apk
+          $BT/aapt2 dump badging app-debug.apk | head -40
+          $BT/apksigner verify --verbose --print-certs app-debug.apk || true
+          $BT/zipalign -c -v 4 app-debug.apk | tail -3 || true
+          unzip -l app-debug.apk | grep -E "\.so$" | head
