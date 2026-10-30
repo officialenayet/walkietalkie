@@ -1,0 +1,767 @@
+name: Build WalkieTalk APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check google-services.json
+        run: |
+          test -f google-services.json || (echo "google-services.json repo er root e upload koro" && exit 1)
+
+      - name: Project files banao
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'WT_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("com.google.gms.google-services")
+          }
+
+          android {
+              namespace = "com.walkietalk.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.walkietalk.app"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation(platform("com.google.firebase:firebase-bom:33.1.2"))
+              implementation("com.google.firebase:firebase-auth-ktx")
+              implementation("com.google.firebase:firebase-firestore-ktx")
+              implementation("io.getstream:stream-webrtc-android:1.1.1")
+          }
+          WT_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'WT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="WalkieTalk"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".WalkieService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="walkie_talkie_listener" />
+                  </service>
+              </application>
+          </manifest>
+          WT_EOF
+          mkdir -p app/src/main/java/com/walkietalk/app
+          cat > app/src/main/java/com/walkietalk/app/Call.kt <<'WT_EOF'
+          package com.walkietalk.app
+
+          import android.content.Context
+          import com.google.firebase.firestore.DocumentChange
+          import com.google.firebase.firestore.DocumentReference
+          import com.google.firebase.firestore.ListenerRegistration
+          import org.webrtc.AudioSource
+          import org.webrtc.AudioTrack
+          import org.webrtc.DataChannel
+          import org.webrtc.IceCandidate
+          import org.webrtc.MediaConstraints
+          import org.webrtc.MediaStream
+          import org.webrtc.PeerConnection
+          import org.webrtc.PeerConnectionFactory
+          import org.webrtc.RtpReceiver
+          import org.webrtc.RtpTransceiver
+          import org.webrtc.SdpObserver
+          import org.webrtc.SessionDescription
+          import org.webrtc.audio.JavaAudioDeviceModule
+
+          object Cfg {
+              const val TURN_USER = "e67e578a63af4443419fec23"
+              const val TURN_PASS = "17MRacfYDu+CzIyf"
+          }
+
+          object Rtc {
+              private var factory: PeerConnectionFactory? = null
+
+              @Synchronized
+              fun factory(ctx: Context): PeerConnectionFactory {
+                  factory?.let { return it }
+                  val app = ctx.applicationContext
+                  PeerConnectionFactory.initialize(
+                      PeerConnectionFactory.InitializationOptions.builder(app).createInitializationOptions()
+                  )
+                  val adm = JavaAudioDeviceModule.builder(app).createAudioDeviceModule()
+                  val f = PeerConnectionFactory.builder().setAudioDeviceModule(adm).createPeerConnectionFactory()
+                  factory = f
+                  return f
+              }
+
+              fun iceServers(): List<PeerConnection.IceServer> = listOf(
+                  PeerConnection.IceServer.builder("stun:stun.relay.metered.ca:80").createIceServer(),
+                  PeerConnection.IceServer.builder(
+                      listOf(
+                          "turn:global.relay.metered.ca:80",
+                          "turn:global.relay.metered.ca:80?transport=tcp",
+                          "turn:global.relay.metered.ca:443",
+                          "turns:global.relay.metered.ca:443?transport=tcp"
+                      )
+                  ).setUsername(Cfg.TURN_USER).setPassword(Cfg.TURN_PASS).createIceServer()
+              )
+          }
+
+          open class SdpAdapter : SdpObserver {
+              override fun onCreateSuccess(d: SessionDescription?) {}
+              override fun onSetSuccess() {}
+              override fun onCreateFailure(e: String?) {}
+              override fun onSetFailure(e: String?) {}
+          }
+
+          /** side = "caller" (je bole) ba "callee" (je shune) */
+          class Call(ctx: Context, private val ref: DocumentReference, private val side: String) {
+              private val factory = Rtc.factory(ctx)
+              private var pc: PeerConnection? = null
+              private var source: AudioSource? = null
+              private var track: AudioTrack? = null
+              private val regs = mutableListOf<ListenerRegistration>()
+              private val pending = mutableListOf<IceCandidate>()
+              private val otherSide = if (side == "caller") "callee" else "caller"
+
+              @Volatile var closed = false
+              @Volatile private var remoteSet = false
+              @Volatile private var gotAnswer = false
+              var onClosed: (() -> Unit)? = null
+
+              private val observer = object : PeerConnection.Observer {
+                  override fun onIceCandidate(c: IceCandidate?) {
+                      if (c == null) return
+                      ref.collection("candidates").add(
+                          mapOf("side" to side, "mid" to c.sdpMid, "idx" to c.sdpMLineIndex, "sdp" to c.sdp)
+                      )
+                  }
+                  override fun onSignalingChange(s: PeerConnection.SignalingState?) {}
+                  override fun onIceConnectionChange(s: PeerConnection.IceConnectionState?) {}
+                  override fun onIceConnectionReceivingChange(b: Boolean) {}
+                  override fun onIceGatheringChange(s: PeerConnection.IceGatheringState?) {}
+                  override fun onIceCandidatesRemoved(a: Array<out IceCandidate>?) {}
+                  override fun onAddStream(s: MediaStream?) {}
+                  override fun onRemoveStream(s: MediaStream?) {}
+                  override fun onDataChannel(d: DataChannel?) {}
+                  override fun onRenegotiationNeeded() {}
+                  override fun onAddTrack(r: RtpReceiver?, s: Array<out MediaStream>?) {}
+              }
+
+              private fun newPc(): PeerConnection? {
+                  val cfg = PeerConnection.RTCConfiguration(Rtc.iceServers())
+                  cfg.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                  pc = factory.createPeerConnection(cfg, observer)
+                  return pc
+              }
+
+              private fun drain() {
+                  val list: List<IceCandidate>
+                  synchronized(pending) {
+                      list = pending.toList()
+                      pending.clear()
+                  }
+                  list.forEach { pc?.addIceCandidate(it) }
+              }
+
+              private fun listenCandidates() {
+                  regs += ref.collection("candidates").whereEqualTo("side", otherSide)
+                      .addSnapshotListener { qs, _ ->
+                          if (qs == null) return@addSnapshotListener
+                          for (ch in qs.documentChanges) {
+                              if (ch.type != DocumentChange.Type.ADDED) continue
+                              val d = ch.document
+                              val c = IceCandidate(
+                                  d.getString("mid"),
+                                  (d.getLong("idx") ?: 0L).toInt(),
+                                  d.getString("sdp") ?: continue
+                              )
+                              if (remoteSet) pc?.addIceCandidate(c)
+                              else synchronized(pending) { pending.add(c) }
+                          }
+                      }
+              }
+
+              // ---- Je bole (caller) ----
+              fun startAsCaller(toUid: String, fromCode: String, myUid: String) {
+                  val p = newPc() ?: return
+                  source = factory.createAudioSource(MediaConstraints())
+                  track = factory.createAudioTrack("a0", source)
+                  p.addTransceiver(
+                      track,
+                      RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY)
+                  )
+                  listenCandidates()
+                  p.createOffer(object : SdpAdapter() {
+                      override fun onCreateSuccess(d: SessionDescription?) {
+                          if (d == null || closed) return
+                          p.setLocalDescription(SdpAdapter(), d)
+                          ref.set(
+                              mapOf(
+                                  "from" to myUid, "to" to toUid, "fromCode" to fromCode,
+                                  "state" to "offer", "offer" to d.description
+                              )
+                          ).addOnSuccessListener {
+                              if (closed) {
+                                  ref.delete()
+                              } else {
+                                  regs += ref.addSnapshotListener { s, e ->
+                                      if (e != null || s == null || closed) return@addSnapshotListener
+                                      if (!s.exists()) { close(); return@addSnapshotListener }
+                                      val ans = s.getString("answer")
+                                      if (ans != null && !gotAnswer) {
+                                          gotAnswer = true
+                                          pc?.setRemoteDescription(object : SdpAdapter() {
+                                              override fun onSetSuccess() { remoteSet = true; drain() }
+                                          }, SessionDescription(SessionDescription.Type.ANSWER, ans))
+                                      }
+                                      if (s.getString("state") == "ended") close()
+                                  }
+                              }
+                          }
+                      }
+                  }, MediaConstraints())
+              }
+
+              // ---- Je shune (callee) ----
+              fun startAsCallee(offer: String) {
+                  val p = newPc() ?: return
+                  listenCandidates()
+                  regs += ref.addSnapshotListener { s, e ->
+                      if (e != null || s == null || closed) return@addSnapshotListener
+                      if (!s.exists() || s.getString("state") == "ended") close()
+                  }
+                  p.setRemoteDescription(object : SdpAdapter() {
+                      override fun onSetSuccess() {
+                          remoteSet = true
+                          drain()
+                          p.createAnswer(object : SdpAdapter() {
+                              override fun onCreateSuccess(d: SessionDescription?) {
+                                  if (d == null || closed) return
+                                  p.setLocalDescription(SdpAdapter(), d)
+                                  ref.update(mapOf("answer" to d.description, "state" to "answered"))
+                              }
+                          }, MediaConstraints())
+                      }
+                  }, SessionDescription(SessionDescription.Type.OFFER, offer))
+              }
+
+              @Synchronized
+              fun close() {
+                  if (closed) return
+                  closed = true
+                  regs.forEach { it.remove() }
+                  regs.clear()
+                  try { pc?.close() } catch (_: Exception) {}
+                  try { pc?.dispose() } catch (_: Exception) {}
+                  pc = null
+                  try { track?.dispose() } catch (_: Exception) {}
+                  try { source?.dispose() } catch (_: Exception) {}
+                  onClosed?.invoke()
+              }
+
+              /** Button charle dile / kotha shesh */
+              fun hangup() {
+                  val wasCaller = side == "caller"
+                  close()
+                  if (wasCaller) ref.delete()
+              }
+          }
+          WT_EOF
+          mkdir -p app/src/main/java/com/walkietalk/app
+          cat > app/src/main/java/com/walkietalk/app/MainActivity.kt <<'WT_EOF'
+          package com.walkietalk.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.PowerManager
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import com.google.firebase.auth.FirebaseAuth
+          import com.google.firebase.firestore.FirebaseFirestore
+          import com.google.firebase.firestore.FirebaseFirestoreException
+          import com.google.firebase.firestore.Transaction
+          import kotlin.random.Random
+
+          class MainActivity : Activity() {
+              private val db by lazy { FirebaseFirestore.getInstance() }
+              private lateinit var idView: TextView
+              private lateinit var statusView: TextView
+              private lateinit var input: EditText
+              private lateinit var list: LinearLayout
+              private lateinit var ptt: Button
+
+              private var selected: String? = null
+              private val uidCache = HashMap<String, String>()
+              private var call: Call? = null
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildUi()
+                  askPermissions()
+                  register()
+              }
+
+              private fun buildUi() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(36), dp(20), dp(20))
+                  }
+                  idView = TextView(this).apply {
+                      text = "Tomar ID: ..."
+                      textSize = 24f
+                      setTextColor(Color.BLACK)
+                      gravity = Gravity.CENTER
+                  }
+                  statusView = TextView(this).apply {
+                      text = "Registration hocche..."
+                      textSize = 14f
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(4), 0, dp(12))
+                  }
+                  val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  input = EditText(this).apply {
+                      hint = "Bondhur 6-digit ID"
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setSingleLine()
+                  }
+                  val add = Button(this).apply { text = "Add" }
+                  row.addView(input, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  row.addView(add)
+
+                  list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val scroll = ScrollView(this).apply { addView(list) }
+
+                  ptt = Button(this).apply {
+                      text = "DHORE RAKHO\nKOTHA BOLO"
+                      textSize = 20f
+                      setTextColor(Color.WHITE)
+                      setBackgroundColor(Color.rgb(0x3F, 0x51, 0xB5))
+                  }
+
+                  root.addView(idView)
+                  root.addView(statusView)
+                  root.addView(row)
+                  root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+                  root.addView(ptt, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(170)))
+                  setContentView(root)
+
+                  add.setOnClickListener { addContact() }
+                  ptt.setOnTouchListener { _, ev ->
+                      when (ev.action) {
+                          MotionEvent.ACTION_DOWN -> { startTalk(); true }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { stopTalk(); true }
+                          else -> false
+                      }
+                  }
+                  refreshList()
+              }
+
+              private fun askPermissions() {
+                  val need = ArrayList<String>()
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+                      need.add(Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 1)
+              }
+
+              // ---------- Registration ----------
+              private fun register() {
+                  val auth = FirebaseAuth.getInstance()
+                  if (auth.currentUser == null) {
+                      auth.signInAnonymously()
+                          .addOnSuccessListener { claim() }
+                          .addOnFailureListener { statusView.text = "Login hoy ni: ${it.message}" }
+                  } else claim()
+              }
+
+              private fun claim() {
+                  val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return
+                  val existing = Store.myCode(this)
+                  if (existing != null && Store.myUid(this) == uid) {
+                      ready(existing)
+                  } else {
+                      tryClaim(uid, 0)
+                  }
+              }
+
+              private fun tryClaim(uid: String, n: Int) {
+                  if (n > 10) { statusView.text = "ID pawa jay ni, app abar open koro"; return }
+                  val code = (100000 + Random.nextInt(900000)).toString()
+                  val ref = db.collection("ids").document(code)
+                  db.runTransaction(Transaction.Function<Any?> { t ->
+                      if (t.get(ref).exists()) {
+                          throw FirebaseFirestoreException("taken", FirebaseFirestoreException.Code.ABORTED)
+                      }
+                      t.set(ref, mapOf("uid" to uid))
+                      null
+                  }).addOnSuccessListener {
+                      Store.setMy(this, code, uid)
+                      ready(code)
+                  }.addOnFailureListener {
+                      if (it is FirebaseFirestoreException && it.code == FirebaseFirestoreException.Code.ABORTED) {
+                          tryClaim(uid, n + 1)
+                      } else {
+                          statusView.text = "Error: ${it.message}"
+                      }
+                  }
+              }
+
+              private fun ready(code: String) {
+                  idView.text = "Tomar ID: $code"
+                  statusView.text = "Ready. Bondhur ID add koro, select koro, tarpor dhore rakho."
+                  // save kora contact gular uid age theke ber kore rakhi
+                  Store.contacts(this).forEach { resolve(it) }
+                  startForegroundService(Intent(this, WalkieService::class.java))
+                  askBattery()
+              }
+
+              private fun askBattery() {
+                  if (Store.batteryAsked(this)) return
+                  val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                  if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                      Store.setBatteryAsked(this)
+                      try {
+                          startActivity(
+                              Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                                  .setData(Uri.parse("package:$packageName"))
+                          )
+                      } catch (_: Exception) {}
+                  }
+              }
+
+              // ---------- Contacts ----------
+              private fun resolve(code: String, then: (() -> Unit)? = null) {
+                  if (uidCache.containsKey(code)) { then?.invoke(); return }
+                  db.collection("ids").document(code).get().addOnSuccessListener { s ->
+                      val u = s.getString("uid")
+                      if (u != null) { uidCache[code] = u; then?.invoke() }
+                  }
+              }
+
+              private fun addContact() {
+                  val code = input.text.toString().trim()
+                  if (code.length != 6) { toast("6-digit ID dao"); return }
+                  if (code == Store.myCode(this)) { toast("Eta tomar nijer ID"); return }
+                  db.collection("ids").document(code).get().addOnSuccessListener { s ->
+                      val u = s.getString("uid")
+                      if (u == null) {
+                          toast("Ei ID pawa jay ni")
+                      } else {
+                          uidCache[code] = u
+                          Store.addContact(this, code)
+                          input.setText("")
+                          if (selected == null) selected = code
+                          refreshList()
+                      }
+                  }.addOnFailureListener { toast("Net check koro") }
+              }
+
+              private fun refreshList() {
+                  list.removeAllViews()
+                  for (code in Store.contacts(this)) {
+                      val b = Button(this).apply {
+                          text = if (code == selected) "✔  $code" else code
+                          textSize = 18f
+                          setOnClickListener {
+                              selected = code
+                              resolve(code)
+                              refreshList()
+                          }
+                          setOnLongClickListener {
+                              Store.removeContact(this@MainActivity, code)
+                              if (selected == code) selected = null
+                              toast("$code muche gelo")
+                              refreshList()
+                              true
+                          }
+                      }
+                      list.addView(b)
+                  }
+              }
+
+              // ---------- Talk ----------
+              private fun setTalking(on: Boolean) {
+                  ptt.setBackgroundColor(if (on) Color.RED else Color.rgb(0x3F, 0x51, 0xB5))
+                  ptt.text = if (on) "KOTHA BOLCHO..." else "DHORE RAKHO\nKOTHA BOLO"
+              }
+
+              private fun startTalk() {
+                  val code = selected
+                  if (code == null) { toast("Age ekjon bondhu select koro"); return }
+                  val to = uidCache[code]
+                  if (to == null) { resolve(code); toast("ID check hocche, abar chesta koro"); return }
+                  val me = FirebaseAuth.getInstance().currentUser?.uid
+                  val myCode = Store.myCode(this)
+                  if (me == null || myCode == null) { toast("Registration hocche..."); return }
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      askPermissions(); return
+                  }
+                  if (call != null) return
+                  val c = Call(applicationContext, db.collection("calls").document(), "caller")
+                  call = c
+                  c.onClosed = { runOnUiThread { call = null; setTalking(false) } }
+                  setTalking(true)
+                  c.startAsCaller(to, myCode, me)
+              }
+
+              private fun stopTalk() {
+                  call?.hangup()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  call?.hangup()
+              }
+          }
+          WT_EOF
+          mkdir -p app/src/main/java/com/walkietalk/app
+          cat > app/src/main/java/com/walkietalk/app/Store.kt <<'WT_EOF'
+          package com.walkietalk.app
+
+          import android.content.Context
+
+          object Store {
+              private fun p(c: Context) = c.getSharedPreferences("wt", Context.MODE_PRIVATE)
+
+              fun myCode(c: Context): String? = p(c).getString("code", null)
+              fun myUid(c: Context): String? = p(c).getString("uid", null)
+
+              fun setMy(c: Context, code: String, uid: String) {
+                  p(c).edit().putString("code", code).putString("uid", uid).apply()
+              }
+
+              fun contacts(c: Context): List<String> =
+                  (p(c).getStringSet("contacts", emptySet()) ?: emptySet()).toList().sorted()
+
+              fun addContact(c: Context, code: String) {
+                  val s = HashSet(contacts(c))
+                  s.add(code)
+                  p(c).edit().putStringSet("contacts", s).apply()
+              }
+
+              fun removeContact(c: Context, code: String) {
+                  val s = HashSet(contacts(c))
+                  s.remove(code)
+                  p(c).edit().putStringSet("contacts", s).apply()
+              }
+
+              fun batteryAsked(c: Context): Boolean = p(c).getBoolean("battery_asked", false)
+              fun setBatteryAsked(c: Context) { p(c).edit().putBoolean("battery_asked", true).apply() }
+          }
+          WT_EOF
+          mkdir -p app/src/main/java/com/walkietalk/app
+          cat > app/src/main/java/com/walkietalk/app/WalkieService.kt <<'WT_EOF'
+          package com.walkietalk.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.media.AudioManager
+          import android.os.Build
+          import android.os.IBinder
+          import android.os.PowerManager
+          import com.google.firebase.auth.FirebaseAuth
+          import com.google.firebase.firestore.DocumentChange
+          import com.google.firebase.firestore.FirebaseFirestore
+          import com.google.firebase.firestore.ListenerRegistration
+          import com.google.firebase.firestore.QueryDocumentSnapshot
+
+          class WalkieService : Service() {
+              private var reg: ListenerRegistration? = null
+              private var current: Call? = null
+              private var wl: PowerManager.WakeLock? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  startForeground(1, buildNotification())
+                  if (wl == null) {
+                      val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                      wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "walkietalk:listener").apply { acquire() }
+                  }
+                  listen()
+                  return START_STICKY
+              }
+
+              private fun buildNotification(): Notification {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(
+                          NotificationChannel("walkie", "WalkieTalk", NotificationManager.IMPORTANCE_LOW)
+                      )
+                  }
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "walkie")
+                  else Notification.Builder(this)
+                  return b.setContentTitle("WalkieTalk chalu ache")
+                      .setContentText("Bondhur kotha shunar jonno ready")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              private fun listen() {
+                  if (reg != null) return
+                  val uid = FirebaseAuth.getInstance().currentUser?.uid
+                  if (uid == null) { stopSelf(); return }
+                  reg = FirebaseFirestore.getInstance().collection("calls")
+                      .whereEqualTo("to", uid)
+                      .whereEqualTo("state", "offer")
+                      .addSnapshotListener { qs, _ ->
+                          if (qs == null) return@addSnapshotListener
+                          for (ch in qs.documentChanges) {
+                              if (ch.type == DocumentChange.Type.ADDED) handle(ch.document)
+                          }
+                      }
+              }
+
+              private fun handle(d: QueryDocumentSnapshot) {
+                  if (current != null) return
+                  val from = d.getString("from") ?: return
+                  val code = d.getString("fromCode") ?: return
+                  val offer = d.getString("offer") ?: return
+                  // shudhu approved (save kora) contact er kotha auto-play hobe
+                  if (code !in Store.contacts(this)) return
+                  FirebaseFirestore.getInstance().collection("ids").document(code).get()
+                      .addOnSuccessListener { s ->
+                          if (s.getString("uid") != from || current != null) return@addOnSuccessListener
+                          val c = Call(applicationContext, d.reference, "callee")
+                          current = c
+                          audioOn()
+                          c.onClosed = { current = null; audioOff() }
+                          c.startAsCallee(offer)
+                      }
+              }
+
+              private fun audioOn() {
+                  try {
+                      val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                      am.mode = AudioManager.MODE_IN_COMMUNICATION
+                      am.isSpeakerphoneOn = true
+                      am.setStreamVolume(
+                          AudioManager.STREAM_VOICE_CALL,
+                          am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL), 0
+                      )
+                  } catch (_: Exception) {}
+              }
+
+              private fun audioOff() {
+                  try {
+                      val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                      am.isSpeakerphoneOn = false
+                      am.mode = AudioManager.MODE_NORMAL
+                  } catch (_: Exception) {}
+              }
+
+              override fun onDestroy() {
+                  reg?.remove()
+                  reg = null
+                  current?.close()
+                  wl?.let { if (it.isHeld) it.release() }
+                  super.onDestroy()
+              }
+          }
+          WT_EOF
+          cat > build.gradle.kts <<'WT_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+              id("com.google.gms.google-services") version "4.4.2" apply false
+          }
+          WT_EOF
+          cat > gradle.properties <<'WT_EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          WT_EOF
+          cat > settings.gradle.kts <<'WT_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "WalkieTalk"
+          include(":app")
+          WT_EOF
+          cp google-services.json app/google-services.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WalkieTalk-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
