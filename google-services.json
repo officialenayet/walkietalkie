@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "2182832797",
+    "project_id": "walkietalk-b34ac",
+    "storage_bucket": "walkietalk-b34ac.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:2182832797:android:2eb597c1b995ccbb472a74",
+        "android_client_info": {
+          "package_name": "com.walkietalk.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCqDpHlaUaE0MWOvhSYzp1N-zAwprWICBA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
